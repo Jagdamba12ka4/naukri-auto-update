@@ -44,7 +44,7 @@ jobs:
           GMAIL_USER: ${{ secrets.NAUKRI_EMAIL }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RESUME_PATH: resume/your_resume.pdf
-        run: python naukri_update_v5.py
+        run: python naukri_update_v6.py
 
       - name: Screenshots upload
         if: always()
