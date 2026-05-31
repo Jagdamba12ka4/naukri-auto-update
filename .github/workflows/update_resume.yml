@@ -2,57 +2,73 @@ name: Naukri Resume Auto-Update
 
 on:
   schedule:
-    # Morning 9 baje IST = UTC 3:30 baje
+    # Subah 9:00 AM IST = 3:30 AM UTC
     - cron: '30 3 * * *'
-    # Shaam 4 baje IST = UTC 10:30 baje  
+    # Shaam 4:00 PM IST = 10:30 AM UTC
     - cron: '30 10 * * *'
-  
-  # Manual trigger bhi kar sako
+
+  # Manual test ke liye
   workflow_dispatch:
 
 jobs:
   update-resume:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 15
+
     steps:
-      - name: Repository checkout karo
+      - name: Repository checkout
         uses: actions/checkout@v4
 
-      - name: Python setup karo
+      - name: Python 3.11 setup
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Chrome aur ChromeDriver install karo
+      - name: Chrome install karo
         run: |
-          sudo apt-get update
-          sudo apt-get install -y wget gnupg unzip
-          
-          # Google Chrome install
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update
-          sudo apt-get install -y google-chrome-stable
-          
-          # ChromeDriver version match karke install karo
-          CHROME_VERSION=$(google-chrome --version | awk '{print $3}' | cut -d. -f1)
-          echo "Chrome version: $CHROME_VERSION"
-          
-          # ChromeDriver download
-          CHROMEDRIVER_URL="https://storage.googleapis.com/chrome-for-testing-public/$(curl -s https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_VERSION})/linux64/chromedriver-linux64.zip"
-          wget -q "$CHROMEDRIVER_URL" -O chromedriver.zip
-          unzip chromedriver.zip
+          sudo apt-get update -qq
+          sudo apt-get install -y wget gnupg unzip curl
+
+          # Google Chrome stable install
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
+
+          echo "✅ Chrome version:"
+          google-chrome --version
+
+      - name: ChromeDriver install karo (version match)
+        run: |
+          CHROME_VERSION=$(google-chrome --version | grep -oP '\d+' | head -1)
+          echo "Chrome major version: $CHROME_VERSION"
+
+          # ChromeDriver JSON endpoint se latest version lo
+          DRIVER_VERSION=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_VERSION}")
+          echo "ChromeDriver version: $DRIVER_VERSION"
+
+          wget -q "https://storage.googleapis.com/chrome-for-testing-public/${DRIVER_VERSION}/linux64/chromedriver-linux64.zip"
+          unzip -q chromedriver-linux64.zip
           sudo mv chromedriver-linux64/chromedriver /usr/bin/chromedriver
           sudo chmod +x /usr/bin/chromedriver
-          
-          echo "ChromeDriver version:"
+
+          echo "✅ ChromeDriver version:"
           chromedriver --version
 
-      - name: Python dependencies install karo
+      - name: Python packages install karo
         run: |
-          pip install -r requirements.txt
+          pip install --quiet selenium==4.18.1
 
-      - name: Resume update script chalao
+      - name: Resume file check karo
+        run: |
+          if [ -f "resume/your_resume.pdf" ]; then
+            echo "✅ Resume file mili!"
+            ls -lh resume/
+          else
+            echo "❌ resume/your_resume.pdf nahi mili!"
+            ls -la resume/ 2>/dev/null || echo "resume/ folder bhi nahi hai!"
+            exit 1
+          fi
+
+      - name: Naukri resume update karo
         env:
           NAUKRI_EMAIL: ${{ secrets.NAUKRI_EMAIL }}
           NAUKRI_PASSWORD: ${{ secrets.NAUKRI_PASSWORD }}
@@ -60,10 +76,13 @@ jobs:
         run: |
           python naukri_update.py
 
-      - name: Error screenshot upload karo (agar fail hua)
-        if: failure()
+      # ── Screenshots hamesha upload karo (success ya fail) ────────
+      - name: Screenshots upload karo
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: error-screenshot
-          path: error_screenshot.png
-          retention-days: 7
+          name: screenshots-${{ github.run_number }}
+          path: |
+            *.png
+          retention-days: 5
+          if-no-files-found: ignore
