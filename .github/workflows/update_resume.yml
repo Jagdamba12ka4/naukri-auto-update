@@ -1,1 +1,69 @@
+name: Naukri Resume Auto-Update
 
+on:
+  schedule:
+    # Morning 9 baje IST = UTC 3:30 baje
+    - cron: '30 3 * * *'
+    # Shaam 4 baje IST = UTC 10:30 baje  
+    - cron: '30 10 * * *'
+  
+  # Manual trigger bhi kar sako
+  workflow_dispatch:
+
+jobs:
+  update-resume:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Repository checkout karo
+        uses: actions/checkout@v4
+
+      - name: Python setup karo
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Chrome aur ChromeDriver install karo
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg unzip
+          
+          # Google Chrome install
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+          
+          # ChromeDriver version match karke install karo
+          CHROME_VERSION=$(google-chrome --version | awk '{print $3}' | cut -d. -f1)
+          echo "Chrome version: $CHROME_VERSION"
+          
+          # ChromeDriver download
+          CHROMEDRIVER_URL="https://storage.googleapis.com/chrome-for-testing-public/$(curl -s https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_VERSION})/linux64/chromedriver-linux64.zip"
+          wget -q "$CHROMEDRIVER_URL" -O chromedriver.zip
+          unzip chromedriver.zip
+          sudo mv chromedriver-linux64/chromedriver /usr/bin/chromedriver
+          sudo chmod +x /usr/bin/chromedriver
+          
+          echo "ChromeDriver version:"
+          chromedriver --version
+
+      - name: Python dependencies install karo
+        run: |
+          pip install -r requirements.txt
+
+      - name: Resume update script chalao
+        env:
+          NAUKRI_EMAIL: ${{ secrets.NAUKRI_EMAIL }}
+          NAUKRI_PASSWORD: ${{ secrets.NAUKRI_PASSWORD }}
+          RESUME_PATH: resume/your_resume.pdf
+        run: |
+          python naukri_update.py
+
+      - name: Error screenshot upload karo (agar fail hua)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: error-screenshot
+          path: error_screenshot.png
+          retention-days: 7
