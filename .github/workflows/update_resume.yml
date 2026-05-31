@@ -2,12 +2,8 @@ name: Naukri Resume Auto-Update
 
 on:
   schedule:
-    # Subah 9:00 AM IST = 3:30 AM UTC
-    - cron: '30 3 * * *'
-    # Shaam 4:00 PM IST = 10:30 AM UTC
-    - cron: '30 10 * * *'
-
-  # Manual test ke liye
+    - cron: '30 3 * * *'   # 9:00 AM IST
+    - cron: '30 10 * * *'  # 4:00 PM IST
   workflow_dispatch:
 
 jobs:
@@ -16,73 +12,45 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Repository checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Python 3.11 setup
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Chrome install karo
+      - name: Chrome install
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y wget gnupg unzip curl
-
-          # Google Chrome stable install
           wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
-
-          echo "✅ Chrome version:"
           google-chrome --version
 
-      - name: ChromeDriver install karo (version match)
+      - name: ChromeDriver install
         run: |
-          CHROME_VERSION=$(google-chrome --version | grep -oP '\d+' | head -1)
-          echo "Chrome major version: $CHROME_VERSION"
-
-          # ChromeDriver JSON endpoint se latest version lo
-          DRIVER_VERSION=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_VERSION}")
-          echo "ChromeDriver version: $DRIVER_VERSION"
-
-          wget -q "https://storage.googleapis.com/chrome-for-testing-public/${DRIVER_VERSION}/linux64/chromedriver-linux64.zip"
+          VER=$(google-chrome --version | grep -oP '\d+' | head -1)
+          DRV=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${VER}")
+          wget -q "https://storage.googleapis.com/chrome-for-testing-public/${DRV}/linux64/chromedriver-linux64.zip"
           unzip -q chromedriver-linux64.zip
           sudo mv chromedriver-linux64/chromedriver /usr/bin/chromedriver
           sudo chmod +x /usr/bin/chromedriver
-
-          echo "✅ ChromeDriver version:"
           chromedriver --version
 
-      - name: Python packages install karo
-        run: |
-          pip install --quiet selenium==4.18.1
+      - name: Python packages install
+        run: pip install --quiet selenium==4.18.1
 
-      - name: Resume file check karo
-        run: |
-          if [ -f "resume/your_resume.pdf" ]; then
-            echo "✅ Resume file mili!"
-            ls -lh resume/
-          else
-            echo "❌ resume/your_resume.pdf nahi mili!"
-            ls -la resume/ 2>/dev/null || echo "resume/ folder bhi nahi hai!"
-            exit 1
-          fi
-
-      - name: Naukri resume update karo
+      - name: Resume update
         env:
           NAUKRI_EMAIL: ${{ secrets.NAUKRI_EMAIL }}
           NAUKRI_PASSWORD: ${{ secrets.NAUKRI_PASSWORD }}
+          GMAIL_USER: ${{ secrets.NAUKRI_EMAIL }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RESUME_PATH: resume/your_resume.pdf
-        run: |
-          python naukri_update.py
+        run: python naukri_update_v4.py
 
-      # ── Screenshots hamesha upload karo (success ya fail) ────────
-      - name: Screenshots upload karo
+      - name: Screenshots upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: screenshots-${{ github.run_number }}
-          path: |
-            *.png
+          path: "*.png"
           retention-days: 5
           if-no-files-found: ignore
