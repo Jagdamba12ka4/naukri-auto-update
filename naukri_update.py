@@ -1,16 +1,19 @@
 import os
+import re
 import time
+import imaplib
+import email
+import random
 import logging
+from datetime import datetime, timezone
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.webdriver.common.action_chains import ActionChains
 
-# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -18,298 +21,400 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def setup_driver():
-    """Headless Chrome driver setup"""
-    chrome_options = Options()
-    chrome_options.add_argument("--headless=new")  # New headless mode
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_argument("--disable-infobars")
-    chrome_options.add_argument("--remote-debugging-port=9222")
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    chrome_options.add_experimental_option('useAutomationExtension', False)
-    chrome_options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
+# ─────────────────────────────────────────────
+# GMAIL SE OTP PADHNA
+# ─────────────────────────────────────────────
 
-    service = Service('/usr/bin/chromedriver')
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-
-    # Bot detection bypass
-    driver.execute_cdp_cmd('Network.setUserAgentOverride', {
-        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                     "Chrome/124.0.0.0 Safari/537.36"
-    })
-    driver.execute_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    )
-    return driver
-
-
-def safe_find_and_fill(driver, wait, locators, value, field_name):
+def get_otp_from_gmail(gmail_user, gmail_app_password, wait_seconds=60):
     """
-    Multiple XPath try karo — jo pehle mile use karo.
-    Naukri ka UI frequently change hota hai, isliye fallback list zaroori hai.
+    Gmail IMAP se Naukri OTP read karo.
+    wait_seconds: kitni der tak OTP email ka wait karein
     """
-    for by, selector in locators:
+    logger.info("📧 Gmail mein Naukri OTP dhundh raha hoon...")
+
+    start_time = time.time()
+    otp_received_after = datetime.now(timezone.utc)
+
+    while time.time() - start_time < wait_seconds:
         try:
-            element = wait.until(EC.presence_of_element_located((by, selector)))
-            driver.execute_script("arguments[0].scrollIntoView(true);", element)
-            time.sleep(0.5)
-            element.click()
-            element.clear()
-            element.send_keys(value)
-            logger.info(f"✅ {field_name} fill hua: {selector}")
-            return element
-        except Exception:
-            continue
-    raise Exception(f"❌ {field_name} ka koi bhi locator kaam nahi kiya!")
+            # Gmail IMAP connect karo
+            mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+            mail.login(gmail_user, gmail_app_password)
+            mail.select("inbox")
+
+            # Naukri ke emails dhundo (last 2 minutes ke)
+            search_criteria = '(FROM "naukri" UNSEEN)'
+            _, message_ids = mail.search(None, search_criteria)
+
+            if message_ids[0]:
+                ids = message_ids[0].split()
+                # Sabse naya email lo
+                latest_id = ids[-1]
+                _, msg_data = mail.fetch(latest_id, "(RFC822)")
+
+                for response in msg_data:
+                    if isinstance(response, tuple):
+                        msg = email.message_from_bytes(response[1])
+
+                        # Email receive time check karo
+                        email_date_str = msg.get("Date", "")
+                        logger.info(f"Email subject: {msg.get('Subject', 'No subject')}")
+
+                        # Email body se OTP nikalo
+                        body = ""
+                        if msg.is_multipart():
+                            for part in msg.walk():
+                                if part.get_content_type() == "text/plain":
+                                    body += part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                                elif part.get_content_type() == "text/html":
+                                    body += part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                        else:
+                            body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+
+                        # OTP pattern dhundo (4 ya 6 digit)
+                        otp_patterns = [
+                            r'\b(\d{6})\b',   # 6 digit OTP
+                            r'\b(\d{4})\b',   # 4 digit OTP
+                            r'OTP[:\s]+(\d+)',
+                            r'code[:\s]+(\d+)',
+                            r'One.?Time.?Password[:\s]+(\d+)',
+                        ]
+
+                        for pattern in otp_patterns:
+                            match = re.search(pattern, body, re.IGNORECASE)
+                            if match:
+                                otp = match.group(1)
+                                logger.info(f"✅ OTP mila: {otp}")
+                                mail.logout()
+                                return otp
+
+                        logger.info("Email mila par OTP nahi mila — retry...")
+
+            mail.logout()
+
+        except Exception as e:
+            logger.warning(f"Gmail check error: {e}")
+
+        logger.info(f"OTP nahi mila — 10 second baad retry ({int(time.time() - start_time)}s elapsed)...")
+        time.sleep(10)
+
+    logger.error(f"❌ {wait_seconds} seconds mein OTP nahi mila!")
+    return None
 
 
-def login_to_naukri(driver, email, password):
-    """Naukri.com pe login karo — multiple fallback selectors ke saath"""
-    logger.info("Naukri login page pe ja raha hoon...")
-    driver.get("https://www.naukri.com/nlogin/login")
-    time.sleep(4)
+def fill_otp(driver, otp):
+    """OTP boxes mein OTP fill karo"""
+    wait = WebDriverWait(driver, 15)
+    logger.info(f"OTP fill kar raha hoon: {otp}")
 
-    wait = WebDriverWait(driver, 25)
-
-    # Page title log karo
-    logger.info(f"Page title: {driver.title}")
-    logger.info(f"Current URL: {driver.current_url}")
-
-    # ── EMAIL FIELD ──────────────────────────────────────────────
-    email_locators = [
-        (By.ID, "usernameField"),
-        (By.XPATH, "//input[@id='usernameField']"),
-        (By.XPATH, "//input[@type='text' and contains(@placeholder,'Email')]"),
-        (By.XPATH, "//input[@type='text' and contains(@placeholder,'email')]"),
-        (By.XPATH, "//input[@name='username']"),
-        (By.XPATH, "//input[contains(@class,'ginput') and @type='text']"),
-        (By.CSS_SELECTOR, "input[placeholder*='Email']"),
-        (By.CSS_SELECTOR, "input[placeholder*='email']"),
-        (By.CSS_SELECTOR, "#usernameField"),
-        (By.XPATH, "(//input[@type='text'])[1]"),
-    ]
-    safe_find_and_fill(driver, wait, email_locators, email, "Email field")
-    time.sleep(1)
-
-    # ── PASSWORD FIELD ───────────────────────────────────────────
-    password_locators = [
-        (By.ID, "passwordField"),
-        (By.XPATH, "//input[@id='passwordField']"),
-        (By.XPATH, "//input[@type='password']"),
-        (By.XPATH, "//input[contains(@placeholder,'password')]"),
-        (By.XPATH, "//input[contains(@placeholder,'Password')]"),
-        (By.CSS_SELECTOR, "input[type='password']"),
-        (By.CSS_SELECTOR, "#passwordField"),
-    ]
-    safe_find_and_fill(driver, wait, password_locators, password, "Password field")
-    time.sleep(1)
-
-    # ── LOGIN BUTTON ─────────────────────────────────────────────
-    login_btn_locators = [
-        (By.XPATH, "//button[@type='submit']"),
-        (By.XPATH, "//button[contains(text(),'Login')]"),
-        (By.XPATH, "//button[contains(text(),'login')]"),
-        (By.XPATH, "//button[contains(text(),'Sign in')]"),
-        (By.XPATH, "//input[@type='submit']"),
-        (By.CSS_SELECTOR, "button[type='submit']"),
-        (By.XPATH, "//div[contains(@class,'login')]//button"),
-    ]
-
-    login_btn = None
-    for by, selector in login_btn_locators:
-        try:
-            login_btn = wait.until(EC.element_to_be_clickable((by, selector)))
-            logger.info(f"✅ Login button mila: {selector}")
-            break
-        except Exception:
-            continue
-
-    if not login_btn:
-        raise Exception("❌ Login button nahi mila!")
-
-    login_btn.click()
-    logger.info("Login button click kiya, wait kar raha hoon...")
-    time.sleep(6)
-
-    # ── LOGIN VERIFY ─────────────────────────────────────────────
-    current_url = driver.current_url
-    logger.info(f"Login ke baad URL: {current_url}")
-
-    # Error message check karo
+    # Method 1: 6 alag alag input boxes
     try:
-        error_msg = driver.find_element(
-            By.XPATH, "//*[contains(@class,'error') or contains(@class,'Error')]"
-        )
-        if error_msg.is_displayed():
-            logger.error(f"Login error message: {error_msg.text}")
+        otp_inputs = driver.find_elements(By.XPATH, "//input[@maxlength='1' and @type='text']")
+        if len(otp_inputs) >= len(otp):
+            for i, digit in enumerate(otp):
+                otp_inputs[i].click()
+                otp_inputs[i].send_keys(digit)
+                time.sleep(0.2)
+            logger.info("✅ OTP individual boxes mein fill kiya!")
+            return True
     except Exception:
         pass
 
+    # Method 2: Single OTP input box
+    try:
+        otp_selectors = [
+            "//input[@type='text' and contains(@placeholder,'OTP')]",
+            "//input[contains(@name,'otp')]",
+            "//input[contains(@id,'otp')]",
+            "//input[@maxlength='6']",
+            "//input[@maxlength='4']",
+        ]
+        for sel in otp_selectors:
+            try:
+                otp_field = wait.until(EC.element_to_be_clickable((By.XPATH, sel)))
+                otp_field.clear()
+                otp_field.send_keys(otp)
+                logger.info(f"✅ OTP single box mein fill kiya: {sel}")
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    logger.error("❌ OTP input field nahi mila!")
+    return False
+
+
+# ─────────────────────────────────────────────
+# CHROME DRIVER
+# ─────────────────────────────────────────────
+
+def human_delay(min_s=1.0, max_s=2.5):
+    time.sleep(random.uniform(min_s, max_s))
+
+
+def human_type(element, text):
+    element.clear()
+    for char in text:
+        element.send_keys(char)
+        time.sleep(random.uniform(0.06, 0.15))
+
+
+def setup_driver():
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1366,768")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--lang=en-IN")
+    options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    options.add_experimental_option('useAutomationExtension', False)
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    service = Service('/usr/bin/chromedriver')
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-IN', 'en'] });
+            window.chrome = { runtime: {} };
+        """
+    })
+    return driver
+
+
+# ─────────────────────────────────────────────
+# LOGIN
+# ─────────────────────────────────────────────
+
+def login_to_naukri(driver, email, password, gmail_user, gmail_app_password):
+    logger.info("Naukri login page pe ja raha hoon...")
+    driver.get("https://www.naukri.com/nlogin/login")
+    human_delay(3, 5)
+
+    logger.info(f"Page: {driver.title}")
+    driver.save_screenshot("01_login_page.png")
+
+    wait = WebDriverWait(driver, 20)
+
+    # Email
+    try:
+        ef = wait.until(EC.element_to_be_clickable((By.ID, "usernameField")))
+        ActionChains(driver).move_to_element(ef).pause(0.5).click().perform()
+        human_delay(0.5, 1)
+        human_type(ef, email)
+        logger.info("✅ Email fill kiya")
+    except Exception as e:
+        logger.error(f"Email field error: {e}")
+        driver.save_screenshot("email_error.png")
+        return False
+
+    human_delay(0.8, 1.5)
+
+    # Password
+    try:
+        pf = wait.until(EC.element_to_be_clickable((By.ID, "passwordField")))
+        ActionChains(driver).move_to_element(pf).pause(0.5).click().perform()
+        human_delay(0.5, 1)
+        human_type(pf, password)
+        logger.info("✅ Password fill kiya")
+    except Exception as e:
+        logger.error(f"Password field error: {e}")
+        driver.save_screenshot("pass_error.png")
+        return False
+
+    human_delay(1, 2)
+
+    # Login button
+    try:
+        btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[@type='submit']")))
+        ActionChains(driver).move_to_element(btn).pause(0.8).click().perform()
+        logger.info("✅ Login button click kiya")
+    except Exception as e:
+        logger.error(f"Login button error: {e}")
+        return False
+
+    human_delay(4, 6)
+    driver.save_screenshot("02_after_login_click.png")
+    logger.info(f"URL: {driver.current_url}")
+
+    # ── OTP PAGE CHECK ────────────────────────────
+    otp_keywords = ["otp", "one time", "verify", "verification"]
+    page_lower = driver.page_source.lower()
+
+    if any(k in page_lower for k in otp_keywords):
+        logger.info("🔐 OTP page detect hua!")
+        driver.save_screenshot("03_otp_page.png")
+
+        # Gmail se OTP lo
+        otp = get_otp_from_gmail(gmail_user, gmail_app_password, wait_seconds=90)
+
+        if not otp:
+            logger.error("❌ OTP nahi mila Gmail se!")
+            return False
+
+        # OTP fill karo
+        if not fill_otp(driver, otp):
+            logger.error("❌ OTP fill nahi hua!")
+            return False
+
+        human_delay(1, 2)
+
+        # Verify button click karo
+        verify_selectors = [
+            "//button[contains(text(),'Verify')]",
+            "//button[contains(text(),'Submit')]",
+            "//button[@type='submit']",
+            "//input[@type='submit']",
+        ]
+        for sel in verify_selectors:
+            try:
+                vbtn = WebDriverWait(driver, 8).until(
+                    EC.element_to_be_clickable((By.XPATH, sel))
+                )
+                vbtn.click()
+                logger.info(f"✅ Verify button click: {sel}")
+                break
+            except Exception:
+                continue
+
+        human_delay(4, 6)
+        driver.save_screenshot("04_after_otp.png")
+        logger.info(f"OTP ke baad URL: {driver.current_url}")
+
+    # ── LOGIN SUCCESS CHECK ───────────────────────
+    current_url = driver.current_url
     if "nlogin" not in current_url and "login" not in current_url:
+        logger.info(f"✅ Login successful! URL: {current_url}")
+        return True
+    elif any(s in current_url for s in ["mnjuser", "myapplication", "dashboard"]):
         logger.info("✅ Login successful!")
         return True
-    elif "myapplication" in current_url or "mnjuser" in current_url:
-        logger.info("✅ Login successful — profile page pe hain!")
-        return True
     else:
-        # Screenshot lo debugging ke liye
-        driver.save_screenshot("login_failed.png")
-        logger.error(f"❌ Login fail hua. URL: {current_url}")
+        logger.error(f"❌ Login fail. URL: {current_url}")
         return False
 
 
+# ─────────────────────────────────────────────
+# RESUME UPDATE
+# ─────────────────────────────────────────────
+
 def update_resume(driver, resume_path):
-    """Resume update karo Naukri profile page pe"""
+    abs_path = os.path.abspath(resume_path)
     wait = WebDriverWait(driver, 30)
-    abs_resume_path = os.path.abspath(resume_path)
 
     logger.info("Profile page pe ja raha hoon...")
     driver.get("https://www.naukri.com/mnjuser/profile")
-    time.sleep(5)
+    human_delay(4, 6)
 
     logger.info(f"Profile URL: {driver.current_url}")
-    driver.save_screenshot("profile_page.png")
+    driver.save_screenshot("05_profile_page.png")
 
-    # ── FILE INPUT DHUNDO ─────────────────────────────────────────
-    file_input_locators = [
-        (By.XPATH, "//input[@type='file']"),
-        (By.CSS_SELECTOR, "input[type='file']"),
-        (By.XPATH, "//input[@type='file' and contains(@class,'fileUpload')]"),
-        (By.XPATH, "//input[@type='file' and contains(@name,'resume')]"),
-        (By.CSS_SELECTOR, "input[type='file'][accept*='pdf']"),
-    ]
+    # File input
+    file_inputs = driver.find_elements(By.XPATH, "//input[@type='file']")
+    logger.info(f"File inputs mile: {len(file_inputs)}")
 
-    file_input = None
-    for by, selector in file_input_locators:
-        try:
-            # File input hidden bhi ho sakta hai — directly interact karo
-            elements = driver.find_elements(by, selector)
-            if elements:
-                file_input = elements[0]
-                logger.info(f"✅ File input mila: {selector}")
-                break
-        except Exception:
-            continue
-
-    if file_input:
-        logger.info(f"Resume upload ho raha hai: {abs_resume_path}")
-        # JavaScript se visible banao (hidden inputs ke liye)
-        driver.execute_script("arguments[0].style.display = 'block';", file_input)
-        driver.execute_script("arguments[0].style.visibility = 'visible';", file_input)
-        file_input.send_keys(abs_resume_path)
-        logger.info("✅ File input mein resume path diya!")
-        time.sleep(5)
+    if file_inputs:
+        fi = file_inputs[0]
+        driver.execute_script("""
+            arguments[0].style.display = 'block';
+            arguments[0].style.visibility = 'visible';
+            arguments[0].style.opacity = '1';
+        """, fi)
+        fi.send_keys(abs_path)
+        logger.info(f"✅ Resume path diya: {abs_path}")
+        human_delay(4, 6)
     else:
-        # Fallback: Upload button click karo pehle
-        logger.info("File input nahi mila — Upload button dhundh raha hoon...")
-        upload_btn_locators = [
-            (By.XPATH, "//button[contains(text(),'Update Resume')]"),
-            (By.XPATH, "//button[contains(text(),'Upload Resume')]"),
-            (By.XPATH, "//a[contains(text(),'Update Resume')]"),
-            (By.XPATH, "//a[contains(text(),'Upload Resume')]"),
-            (By.XPATH, "//*[contains(@class,'upload') and contains(@class,'resume')]"),
-            (By.CSS_SELECTOR, "[class*='resumeUpload']"),
-            (By.XPATH, "//label[contains(text(),'Resume')]"),
-        ]
-
-        for by, selector in upload_btn_locators:
+        # Upload button dhundo
+        for sel in [
+            "//button[contains(text(),'Update Resume')]",
+            "//button[contains(text(),'Upload Resume')]",
+            "//a[contains(text(),'Update Resume')]",
+            "//*[@id='lazyResumeHead']//button",
+        ]:
             try:
-                btn = wait.until(EC.element_to_be_clickable((by, selector)))
+                btn = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, sel)))
                 btn.click()
-                logger.info(f"Upload button click kiya: {selector}")
-                time.sleep(3)
-
-                # Ab file input dhundo
-                file_inputs = driver.find_elements(By.XPATH, "//input[@type='file']")
-                if file_inputs:
-                    driver.execute_script(
-                        "arguments[0].style.display = 'block';", file_inputs[0]
-                    )
-                    file_inputs[0].send_keys(abs_resume_path)
-                    logger.info("✅ Upload button ke baad file input mila aur file di!")
-                    time.sleep(5)
+                human_delay(2, 3)
+                fi2 = driver.find_elements(By.XPATH, "//input[@type='file']")
+                if fi2:
+                    driver.execute_script("arguments[0].style.display='block';", fi2[0])
+                    fi2[0].send_keys(abs_path)
+                    human_delay(4, 6)
+                    logger.info("✅ Upload button ke baad file di!")
                     break
             except Exception:
                 continue
-        else:
-            driver.save_screenshot("upload_failed.png")
-            raise Exception("❌ Koi bhi upload method kaam nahi kiya!")
 
-    # ── SAVE/CONFIRM BUTTON ───────────────────────────────────────
-    save_locators = [
-        (By.XPATH, "//button[contains(text(),'Save')]"),
-        (By.XPATH, "//button[contains(text(),'Confirm')]"),
-        (By.XPATH, "//button[contains(text(),'Update')]"),
-        (By.XPATH, "//button[contains(text(),'Done')]"),
-        (By.CSS_SELECTOR, "button.saveBtn"),
-        (By.XPATH, "//button[@type='submit']"),
-    ]
-
-    for by, selector in save_locators:
+    # Save button
+    for sel in ["//button[contains(text(),'Save')]", "//button[contains(text(),'Confirm')]",
+                "//button[contains(text(),'Update')]", "//button[@type='submit']"]:
         try:
-            save_btn = WebDriverWait(driver, 8).until(
-                EC.element_to_be_clickable((by, selector))
-            )
-            save_btn.click()
-            logger.info(f"✅ Save button click kiya: {selector}")
-            time.sleep(3)
+            btn = WebDriverWait(driver, 6).until(EC.element_to_be_clickable((By.XPATH, sel)))
+            btn.click()
+            logger.info(f"✅ Save click: {sel}")
+            human_delay(2, 3)
             break
         except Exception:
             continue
 
-    # Success verify karo
-    driver.save_screenshot("after_upload.png")
-    logger.info("✅ Resume update process complete!")
+    driver.save_screenshot("06_final.png")
+    logger.info("✅ Resume update complete!")
     return True
 
 
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
 def main():
-    email = os.environ.get("NAUKRI_EMAIL")
-    password = os.environ.get("NAUKRI_PASSWORD")
-    resume_path = os.environ.get("RESUME_PATH", "resume/your_resume.pdf")
+    email        = os.environ.get("NAUKRI_EMAIL")
+    password     = os.environ.get("NAUKRI_PASSWORD")
+    gmail_user   = os.environ.get("GMAIL_USER", email)   # Same email ya alag
+    gmail_pass   = os.environ.get("GMAIL_APP_PASSWORD")
+    resume_path  = os.environ.get("RESUME_PATH", "resume/your_resume.pdf")
 
     if not email or not password:
-        logger.error("❌ NAUKRI_EMAIL aur NAUKRI_PASSWORD set nahi hain!")
+        logger.error("❌ NAUKRI_EMAIL aur NAUKRI_PASSWORD set karo!")
         exit(1)
-
+    if not gmail_pass:
+        logger.error("❌ GMAIL_APP_PASSWORD set karo (Gmail App Password, normal password nahi)!")
+        exit(1)
     if not os.path.exists(resume_path):
-        logger.error(f"❌ Resume file nahi mili: {resume_path}")
+        logger.error(f"❌ Resume nahi mila: {resume_path}")
         exit(1)
 
-    logger.info(f"Resume path: {resume_path}")
+    masked = email[:3] + "***" + email[email.index('@'):]
+    logger.info(f"Account: {masked} | Resume: {resume_path}")
 
     driver = None
     try:
-        logger.info("🚀 Naukri Resume Auto-Update start ho raha hai...")
+        logger.info("🚀 Naukri Auto-Update shuru...")
         driver = setup_driver()
 
-        if login_to_naukri(driver, email, password):
+        if login_to_naukri(driver, email, password, gmail_user, gmail_pass):
             update_resume(driver, resume_path)
-            logger.info("🎉 Resume update complete!")
+            logger.info("🎉 Resume successfully updated!")
         else:
-            logger.error("❌ Login fail — credentials check karo!")
+            logger.error("❌ Login fail!")
             exit(1)
 
     except Exception as e:
-        logger.error(f"❌ Error: {str(e)}")
+        logger.error(f"❌ Fatal: {e}")
         if driver:
-            driver.save_screenshot("error_screenshot.png")
+            driver.save_screenshot("fatal_error.png")
         exit(1)
 
     finally:
         if driver:
             driver.quit()
-            logger.info("Browser band ho gaya.")
+            logger.info("Browser band.")
 
 
 if __name__ == "__main__":
