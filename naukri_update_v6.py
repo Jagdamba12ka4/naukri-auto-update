@@ -5,7 +5,8 @@ import imaplib
 import email
 import random
 import logging
-from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone, timedelta
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -56,11 +57,39 @@ def setup_driver():
     return driver
 
 
-# ── GMAIL OTP ──────────────────────────────────────────────────────────────────
+# ── GMAIL OTP — SIRF FRESH EMAIL ───────────────────────────────────────────────
 
-def get_otp_from_gmail(gmail_user, gmail_app_password, wait_seconds=90):
-    logger.info("📧 Gmail se OTP le raha hoon...")
+def mark_all_naukri_emails_read(gmail_user, gmail_app_password):
+    """
+    Login se PEHLE saari purani Naukri emails ko SEEN mark karo.
+    Isse naya OTP aane pe confusion nahi hoga.
+    """
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        mail.login(gmail_user, gmail_app_password)
+        mail.select("inbox")
+        _, ids = mail.search(None, '(FROM "naukri" UNSEEN)')
+        if ids[0]:
+            for mid in ids[0].split():
+                mail.store(mid, '+FLAGS', '\\Seen')
+            logger.info(f"Purani {len(ids[0].split())} Naukri emails SEEN mark ki gayi")
+        else:
+            logger.info("Koi purani unread Naukri email nahi thi")
+        mail.logout()
+    except Exception as e:
+        logger.warning(f"Mark-read error (ignore kar sakte hain): {e}")
+
+
+def get_fresh_otp_from_gmail(gmail_user, gmail_app_password, login_time, wait_seconds=90):
+    """
+    Sirf login ke BAAD aayi email se OTP lo.
+    login_time: datetime (UTC) — login button click ka waqt
+    """
+    logger.info(f"📧 Gmail mein fresh OTP dhundh raha hoon (login time: {login_time.strftime('%H:%M:%S')} UTC)...")
+
     start = time.time()
+    # 2 minute ki window — naukri OTP usually 10 sec mein aata hai
+    min_email_time = login_time - timedelta(seconds=30)  # 30 sec buffer
 
     while time.time() - start < wait_seconds:
         try:
@@ -68,19 +97,51 @@ def get_otp_from_gmail(gmail_user, gmail_app_password, wait_seconds=90):
             mail.login(gmail_user, gmail_app_password)
             mail.select("inbox")
 
+            # Sirf UNSEEN Naukri emails
             _, ids = mail.search(None, '(FROM "naukri" UNSEEN)')
+
             if ids[0]:
-                latest = ids[0].split()[-1]
-                _, data = mail.fetch(latest, "(RFC822)")
-                for part in data:
-                    if isinstance(part, tuple):
+                # Sab emails check karo — sabse naya lo
+                all_ids = ids[0].split()
+                logger.info(f"Unread Naukri emails: {len(all_ids)}")
+
+                best_otp = None
+                best_time = None
+
+                for mid in all_ids:
+                    _, data = mail.fetch(mid, "(RFC822)")
+                    for part in data:
+                        if not isinstance(part, tuple):
+                            continue
                         msg = email.message_from_bytes(part[1])
-                        logger.info(f"Email subject: {msg.get('Subject')}")
+
+                        # Email time parse karo
+                        date_str = msg.get("Date", "")
+                        try:
+                            email_time = parsedate_to_datetime(date_str)
+                            # UTC mein convert karo
+                            if email_time.tzinfo is None:
+                                email_time = email_time.replace(tzinfo=timezone.utc)
+                            else:
+                                email_time = email_time.astimezone(timezone.utc)
+                        except Exception:
+                            email_time = datetime.now(timezone.utc)
+
+                        subject = msg.get("Subject", "")
+                        logger.info(f"Email time: {email_time.strftime('%H:%M:%S')} UTC | Subject: {subject}")
+
+                        # Sirf login ke baad wala email
+                        if email_time < min_email_time:
+                            logger.info(f"  ⏭️ Purana email skip (login se pehle ka) — time: {email_time}")
+                            # Purana email SEEN mark karo
+                            mail.store(mid, '+FLAGS', '\\Seen')
+                            continue
+
+                        # Body se OTP nikalo
                         body = ""
                         if msg.is_multipart():
                             for p in msg.walk():
-                                ct = p.get_content_type()
-                                if ct in ("text/plain", "text/html"):
+                                if p.get_content_type() in ("text/plain", "text/html"):
                                     body += p.get_payload(decode=True).decode("utf-8", errors="ignore")
                         else:
                             body = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
@@ -90,158 +151,110 @@ def get_otp_from_gmail(gmail_user, gmail_app_password, wait_seconds=90):
                             m = re.search(pattern, body, re.IGNORECASE)
                             if m:
                                 otp = m.group(1)
-                                logger.info(f"✅ OTP mila: {otp}")
-                                mail.logout()
-                                return otp
-            mail.logout()
-        except Exception as e:
-            logger.warning(f"Gmail error: {e}")
+                                # Sabse naya OTP lo
+                                if best_time is None or email_time > best_time:
+                                    best_otp = otp
+                                    best_time = email_time
+                                    logger.info(f"  ✅ Fresh OTP mila: {otp} (time: {email_time.strftime('%H:%M:%S')} UTC)")
+                                break
 
-        logger.info(f"OTP nahi mila abhi — 8s baad retry ({int(time.time()-start)}s)...")
+                mail.logout()
+
+                if best_otp:
+                    return best_otp
+            else:
+                mail.logout()
+
+        except Exception as e:
+            logger.warning(f"Gmail check error: {e}")
+
+        elapsed = int(time.time() - start)
+        logger.info(f"OTP nahi mila — 8s baad retry ({elapsed}s elapsed)...")
         time.sleep(8)
 
+    logger.error(f"❌ {wait_seconds}s mein fresh OTP nahi mila!")
     return None
 
 
-# ── OTP FILL — 5 METHODS ───────────────────────────────────────────────────────
+# ── OTP FILL ────────────────────────────────────────────────────────────────────
 
 def fill_otp(driver, otp):
-    """
-    Naukri ke OTP boxes screenshot mein 6 separate boxes hain.
-    5 alag methods try karte hain — jo pehle kaam kare.
-    """
-    wait = WebDriverWait(driver, 10)
-    logger.info(f"OTP fill karne ki koshish: {otp}")
+    """6 alag boxes mein OTP fill karo — React-style event dispatch ke saath"""
+    logger.info(f"OTP fill kar raha hoon: {otp}")
+    time.sleep(1)
 
-    # DEBUG: page ka OTP-related HTML log karo
-    try:
-        body_html = driver.find_element(By.TAG_NAME, "body").get_attribute("innerHTML")
-        # OTP section dhundo
-        otp_section_match = re.search(r'.{200}otp.{200}', body_html, re.IGNORECASE | re.DOTALL)
-        if otp_section_match:
-            logger.info(f"OTP HTML snippet: {otp_section_match.group()[:300]}")
-    except Exception:
-        pass
-
-    # ── METHOD 1: maxlength=1 inputs (6 separate boxes) ──────────
+    # Method 1: CSS maxlength=1 + JS nativeInputValueSetter (React ke liye)
     try:
         boxes = driver.find_elements(By.CSS_SELECTOR, "input[maxlength='1']")
         if len(boxes) >= len(otp):
-            logger.info(f"Method 1: {len(boxes)} single-char boxes mile")
-            for i, digit in enumerate(otp):
-                b = boxes[i]
-                driver.execute_script("arguments[0].focus();", b)
-                b.click()
-                b.send_keys(digit)
-                time.sleep(0.25)
-            logger.info("✅ Method 1 kaam kiya!")
-            return True
-    except Exception as e:
-        logger.info(f"Method 1 fail: {e}")
-
-    # ── METHOD 2: type="number" inputs ───────────────────────────
-    try:
-        boxes = driver.find_elements(By.CSS_SELECTOR, "input[type='number']")
-        if len(boxes) >= len(otp):
-            logger.info(f"Method 2: {len(boxes)} number inputs mile")
-            for i, digit in enumerate(otp):
-                driver.execute_script("arguments[0].focus();", boxes[i])
-                boxes[i].click()
-                boxes[i].send_keys(digit)
-                time.sleep(0.25)
-            logger.info("✅ Method 2 kaam kiya!")
-            return True
-    except Exception as e:
-        logger.info(f"Method 2 fail: {e}")
-
-    # ── METHOD 3: JavaScript se value set karo (React apps ke liye) ──
-    try:
-        boxes = driver.find_elements(By.CSS_SELECTOR, "input[maxlength='1']")
-        if not boxes:
-            boxes = driver.find_elements(By.CSS_SELECTOR, "input[type='number']")
-        if len(boxes) >= len(otp):
-            logger.info(f"Method 3: JS nativeInputValueSetter try kar raha hoon")
+            logger.info(f"Method 1 (JS React): {len(boxes)} boxes mile")
             for i, digit in enumerate(otp):
                 driver.execute_script("""
                     var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
                         window.HTMLInputElement.prototype, 'value').set;
                     nativeInputValueSetter.call(arguments[0], arguments[1]);
-                    arguments[0].dispatchEvent(new Event('input', { bubbles: true }));
+                    arguments[0].dispatchEvent(new Event('input',  { bubbles: true }));
                     arguments[0].dispatchEvent(new Event('change', { bubbles: true }));
+                    arguments[0].dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
                 """, boxes[i], digit)
+                time.sleep(0.15)
+            logger.info("✅ Method 1 complete!")
+            return True
+    except Exception as e:
+        logger.info(f"Method 1 fail: {e}")
+
+    # Method 2: Click + send_keys har box mein
+    try:
+        boxes = driver.find_elements(By.CSS_SELECTOR, "input[maxlength='1']")
+        if len(boxes) >= len(otp):
+            logger.info(f"Method 2 (click+type): {len(boxes)} boxes")
+            for i, digit in enumerate(otp):
+                b = boxes[i]
+                driver.execute_script("arguments[0].focus();", b)
+                b.click()
+                time.sleep(0.1)
+                b.clear()
+                b.send_keys(digit)
                 time.sleep(0.2)
-            logger.info("✅ Method 3 kaam kiya!")
+            logger.info("✅ Method 2 complete!")
+            return True
+    except Exception as e:
+        logger.info(f"Method 2 fail: {e}")
+
+    # Method 3: Pehle box click, phir ActionChains se type
+    try:
+        boxes = driver.find_elements(By.CSS_SELECTOR, "input[maxlength='1']")
+        if boxes:
+            logger.info("Method 3 (ActionChains)")
+            driver.execute_script("arguments[0].click();", boxes[0])
+            time.sleep(0.3)
+            ActionChains(driver).send_keys(otp).perform()
+            logger.info("✅ Method 3 complete!")
             return True
     except Exception as e:
         logger.info(f"Method 3 fail: {e}")
 
-    # ── METHOD 4: Pehle box pe click, phir poora OTP type ────────
-    try:
-        # Pehla OTP box dhundo
-        first_box_selectors = [
-            "input[maxlength='1']",
-            "input[type='number']",
-            "input[data-index='0']",
-            ".otpContainer input",
-            "[class*='otp'] input",
-            "[id*='otp'] input",
-            "[class*='OTP'] input",
-        ]
-        for sel in first_box_selectors:
-            boxes = driver.find_elements(By.CSS_SELECTOR, sel)
-            if boxes:
-                logger.info(f"Method 4: selector '{sel}' se {len(boxes)} elements mile")
-                driver.execute_script("arguments[0].click();", boxes[0])
-                time.sleep(0.5)
-                # Poora OTP type karo — browser automatically next box pe jaata hai
-                ActionChains(driver).send_keys(otp).perform()
-                logger.info("✅ Method 4 kaam kiya!")
-                return True
-    except Exception as e:
-        logger.info(f"Method 4 fail: {e}")
-
-    # ── METHOD 5: Single OTP input field ─────────────────────────
-    try:
-        single_selectors = [
-            "input[name*='otp']",
-            "input[id*='otp']",
-            "input[placeholder*='OTP']",
-            "input[placeholder*='otp']",
-            "input[maxlength='6']",
-            "input[maxlength='4']",
-            "input[name*='code']",
-        ]
-        for sel in single_selectors:
-            try:
-                el = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, sel)))
-                el.clear()
-                el.send_keys(otp)
-                logger.info(f"✅ Method 5 kaam kiya: {sel}")
-                return True
-            except Exception:
-                continue
-    except Exception as e:
-        logger.info(f"Method 5 fail: {e}")
-
-    # Koi method kaam nahi kiya — HTML dump karo
-    logger.error("❌ Koi bhi OTP fill method kaam nahi kiya!")
+    # Fallback: inputs debug log
+    logger.error("❌ OTP fill nahi hua!")
     try:
         all_inputs = driver.find_elements(By.TAG_NAME, "input")
-        logger.info(f"Page pe kul inputs: {len(all_inputs)}")
+        logger.info(f"Page inputs ({len(all_inputs)}):")
         for inp in all_inputs:
-            logger.info(f"  Input → type={inp.get_attribute('type')} | "
-                        f"id={inp.get_attribute('id')} | "
-                        f"name={inp.get_attribute('name')} | "
+            logger.info(f"  type={inp.get_attribute('type')} | "
                         f"maxlength={inp.get_attribute('maxlength')} | "
-                        f"class={inp.get_attribute('class')}")
+                        f"id={inp.get_attribute('id')} | "
+                        f"class={inp.get_attribute('class')[:50] if inp.get_attribute('class') else ''}")
     except Exception:
         pass
     return False
 
 
-# ── LOGIN ──────────────────────────────────────────────────────────────────────
+# ── LOGIN ────────────────────────────────────────────────────────────────────────
 
 def login_to_naukri(driver, email, password, gmail_user, gmail_app_password):
+    # Login se PEHLE — purani Naukri emails SEEN mark karo
+    mark_all_naukri_emails_read(gmail_user, gmail_app_password)
+
     driver.get("https://www.naukri.com/nlogin/login")
     human_delay(3, 5)
     logger.info(f"Page: {driver.title}")
@@ -265,7 +278,10 @@ def login_to_naukri(driver, email, password, gmail_user, gmail_app_password):
     logger.info("✅ Password fill kiya")
     human_delay(1, 2)
 
-    # Login button
+    # Login button click karne ka EXACT waqt record karo
+    login_click_time = datetime.now(timezone.utc)
+    logger.info(f"Login click time (UTC): {login_click_time.strftime('%H:%M:%S')}")
+
     btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[@type='submit']")))
     ActionChains(driver).move_to_element(btn).pause(0.8).click().perform()
     logger.info("✅ Login click kiya")
@@ -275,20 +291,21 @@ def login_to_naukri(driver, email, password, gmail_user, gmail_app_password):
     logger.info(f"URL: {driver.current_url}")
 
     # OTP page check
-    page_src = driver.page_source.lower()
-    if any(k in page_src for k in ["otp", "one time", "verify your"]):
+    if any(k in driver.page_source.lower() for k in ["otp", "one time", "verify your"]):
         logger.info("🔐 OTP page detect hua!")
         driver.save_screenshot("03_otp_page.png")
 
-        otp = get_otp_from_gmail(gmail_user, gmail_app_password, wait_seconds=90)
+        # FRESH OTP lo (login ke baad aaya hua)
+        otp = get_fresh_otp_from_gmail(gmail_user, gmail_app_password, login_click_time, wait_seconds=90)
         if not otp:
-            logger.error("❌ Gmail se OTP nahi mila!")
+            logger.error("❌ Fresh OTP nahi mila!")
             return False
 
-        human_delay(1, 2)  # OTP fill se pehle thoda wait
+        logger.info(f"OTP use ho raha hai: {otp}")
+        human_delay(1, 2)
 
         if not fill_otp(driver, otp):
-            driver.save_screenshot("03b_otp_fill_failed.png")
+            driver.save_screenshot("03b_fill_failed.png")
             return False
 
         human_delay(1, 2)
@@ -308,7 +325,7 @@ def login_to_naukri(driver, email, password, gmail_user, gmail_app_password):
 
         human_delay(4, 6)
         driver.save_screenshot("05_after_verify.png")
-        logger.info(f"Verify ke baad URL: {driver.current_url}")
+        logger.info(f"Verify baad URL: {driver.current_url}")
 
     # Success check
     url = driver.current_url
@@ -323,11 +340,10 @@ def login_to_naukri(driver, email, password, gmail_user, gmail_app_password):
         return False
 
 
-# ── RESUME UPDATE ──────────────────────────────────────────────────────────────
+# ── RESUME UPDATE ────────────────────────────────────────────────────────────────
 
 def update_resume(driver, resume_path):
     abs_path = os.path.abspath(resume_path)
-    wait = WebDriverWait(driver, 30)
 
     driver.get("https://www.naukri.com/mnjuser/profile")
     human_delay(4, 6)
@@ -360,7 +376,7 @@ def update_resume(driver, resume_path):
                     driver.execute_script("arguments[0].style.display='block';", fi2[0])
                     fi2[0].send_keys(abs_path)
                     human_delay(4, 6)
-                    logger.info("✅ Upload button ke baad resume diya!")
+                    logger.info("✅ Resume upload complete!")
                     break
             except Exception:
                 continue
@@ -382,7 +398,7 @@ def update_resume(driver, resume_path):
     return True
 
 
-# ── MAIN ───────────────────────────────────────────────────────────────────────
+# ── MAIN ─────────────────────────────────────────────────────────────────────────
 
 def main():
     email       = os.environ.get("NAUKRI_EMAIL")
